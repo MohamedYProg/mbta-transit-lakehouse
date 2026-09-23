@@ -168,13 +168,257 @@ to recompute them.
 
 ---
 
-## Explicit schemas, never inference (planned — story 1.7)
+## Explicit schemas, validated on every load
 
 Spark infers a JSON schema by sampling files. If an optional field is absent from
 the sampled set, the column does not exist in the resulting schema — so the
 schema depends on which files happened to be present at read time, and the same
 code produces different results on different days.
 
-Realtime ingestion will define an explicit `StructType` rather than inferring.
-Inference also costs a full extra pass over the data to determine types, but
-non-determinism is the real argument.
+Realtime ingestion uses an explicit `StructType`. But a declared schema has the
+opposite failure: it silently discards any field it does not declare. The first
+version dropped `trip.revenue` and `trip.last_trip` this way.
+
+So every load compares leaf paths between an inferred read and the declared
+schema, and `assert`s that nothing in the data is undeclared. Declared-but-absent
+fields are allowed — they arrive as null, which is the point of declaring them.
+The inference pass costs ~40–86s over ~670 files; the explicit read, explode and
+write cost ~7s. The guard is worth the cost until the file count makes it
+expensive, at which point it moves to a sample-plus-daily-full check.
+
+`bearing` is declared `DoubleType` although every observed value is a whole
+number, because bearings are angles and a feed that starts sending `183.5`
+should not break the pipeline.
+
+---
+
+## Bronze is a pure function of the landing zone
+
+Landing files are never modified or deleted after ingest. Every bronze table can
+be rebuilt from them. This was tested the hard way: a migration deleted a feed
+version from bronze, and it was restored by replaying landing.
+
+The replay is a cell in the static ingest guarded by `RUN_BACKFILL = False`.
+Normal runs write only the version just downloaded; a full replay is a deliberate
+act, because its cost grows with every publication MBTA makes.
+
+---
+
+## Ingestion log counts are per version
+
+With several feed versions in one partitioned table, a plain `count()` reports
+every version combined. Each `ops.ingestion_log` row filters to the version it
+describes, so row-count history compares like with like.
+
+---
+
+## Parse times, never compare them as strings
+
+GTFS permits unpadded hours (`9:05:00`), and `'9:05:00' >= '24:00:00'` is true as
+a string comparison. Any logic about GTFS times splits on `:` and works in
+integer seconds. MBTA happens to pad every value, which makes string comparison
+look correct on this feed while being wrong in general.
+
+---
+
+## Monitor what the collector writes, not what is derived from it
+
+The health check reads the landing zone — file counts per day and the age of the
+newest file — rather than the bronze table. Bronze only changes when a notebook
+runs, so a dead collector and an idle pipeline look identical from bronze. That
+distinction cost ~100 snapshots before it was made.
+
+The freshness threshold is 35 minutes: two 15-minute intervals plus slack for
+serverless start-up. A 20-minute threshold fired on a healthy collector. Alerts
+must tolerate normal jitter, or they stop being read.
+
+---
+
+## Collectors are independent tasks
+
+Vehicle positions and alerts run as separate tasks in one job with no dependency
+between them. A failure fetching one feed must not stop the other from
+collecting, because each lost interval is unrecoverable.
+
+---
+
+## Realtime bronze is a full reload, for now
+
+`04` currently re-reads every snapshot and replaces the table (`replaceWhere
+"_dt IS NOT NULL"`). At ~670 files that takes ~7 seconds, so it is acceptable
+short-term. It grows linearly with history, and is replaced by an incremental,
+watermarked load in story 2.3.
+
+---
+
+## Unscheduled service routes to the unknown member
+
+4.9% of realtime rows are replacement shuttles (`Shuttle-Generic*`,
+`schedule_relationship = ADDED`), added to service rather than scheduled. Their
+trips are not expected in the static timetable (to be confirmed by the join in
+story 2.6). They are kept, resolved to the `-1` unknown member in gold, and counted as a quality
+metric. Dropping them would erase the vehicles that exist precisely because
+scheduled service failed.
+
+---
+
+## Silver reads one feed version, not the latest copy of every row
+
+Silver dimensions are built from the newest `_feed_version` only, after
+asserting that stops, routes and trips all agree on what the newest version is.
+
+Deduplicating across every version and keeping each key's latest row sounds
+equivalent, but is not: a stop removed in a later publication would survive from
+an earlier one, because its latest row is the old one. Filtering to a single
+version reproduces the published schedule exactly. Change across versions is
+SCD2's job.
+
+The agreement check exists because a half-finished ingest could leave `stops`
+on one version and `trips` on another, and silver would join them without error.
+
+---
+
+## Casting uses `try_cast`, and counts what fails
+
+Serverless runs with ANSI mode on. A plain `cast` on a malformed value throws,
+so one bad row fails the whole run. With ANSI off, the same cast silently returns
+null — the failure bronze is designed to prevent.
+
+`try_cast` returns null without throwing, and because the original string is
+still present, failures are countable: a value existed and the cast produced
+null. Each typed table asserts zero failures today; story 3.2 turns failures into
+quarantined rows instead of a failed run.
+
+The cast spec skips columns absent from the data and reports them, rather than
+assuming every documented GTFS field is published.
+
+---
+
+## Codes are conformed through lookup joins, not `when` chains
+
+`route_type` and `location_type` names come from small lookup tables joined in.
+Unmapped codes are reported. A `when(...).otherwise("Unknown")` chain would
+absorb a new code silently; the join makes it visible.
+
+An empty `location_type` is coalesced to 0, because the GTFS spec defines empty
+as "stop or platform". Leaving it null would drop those stops from any filter on
+type 0.
+
+---
+
+## Version diffs use null-safe equality
+
+Comparing a stop across versions uses `<=>`, not `=`. With `=`, two nulls compare
+as null rather than true, so every stop without wheelchair data would count as
+changed.
+
+---
+
+## Surrogate keys are hashes of the natural key
+
+`route_key`, `trip_key` and `stop_key` are `xxhash64` of the natural key.
+`monotonically_increasing_id()`, suggested in the original plan, was tested and
+rejected: rebuilding the same 402 routes with a different partition layout
+changed every single key. Because gold dimensions are rebuilt with `overwrite`,
+unstable keys would silently re-point every existing fact row.
+
+Hash keys are deterministic, need no lookup table and no state, and survive any
+rebuild. Costs: they are large and unordered, collisions are possible in
+principle (each dimension asserts key uniqueness on every write), and changing
+the key recipe changes every key. The usual production alternative is a Delta
+identity column with dimensions loaded by `MERGE`, which gives compact stable
+integers at the price of merge-based loading.
+
+`dim_stop`'s recipe will change to `stop_id + valid_from` when SCD2 arrives,
+giving one key per version of a stop. Facts are rebuilt once at that point.
+
+## `date_key` is a smart key, deliberately
+
+`dim_date` uses `yyyyMMdd` integers rather than hashes. A date never changes
+meaning, and a readable, sortable key lets facts be partitioned and filtered by
+date without a join. This is the conventional exception to "keys carry no
+meaning".
+
+`day_of_week` is ISO (`weekday() + 1`, Monday = 1). Spark's `dayofweek()` makes
+Sunday 1, which silently breaks any weekend logic built on 6 and 7.
+
+## Every dimension has an unknown member
+
+Key `-1`, descriptive columns set to `Unknown`. Facts whose foreign key cannot be
+resolved point there instead of being dropped, and the count of `-1` references
+becomes a quality metric. Each dimension asserts exactly one unknown member, which
+also catches the theoretical case of a hash landing on `-1`.
+
+## `dim_date` coverage is asserted
+
+The notebook fails if any realtime date or scheduled service date falls outside
+`dim_date`'s range, rather than letting those facts resolve silently to `-1`.
+
+---
+
+## GTFS times are stored as seconds since service start
+
+`silver.stop_times` holds `arrival_seconds` and `departure_seconds` as the
+canonical values, alongside the original strings, a `day_offset` (0 or 1) and a
+24-hour `departure_clock`. It deliberately has no timestamp column: a stop time
+belongs to a trip, and a trip runs on many dates. A timestamp only exists once a
+trip is paired with a service date, which happens in `fact_scheduled_stop_time`.
+
+## Timestamps anchor at noon minus 12 hours, per the spec
+
+`service_time_to_ts` converts local noon on the service date to UTC, subtracts 12
+hours, then adds the seconds. On the day clocks go back this anchor sits one hour
+after local midnight; anchoring at midnight would shift every trip that day by an
+hour. The session time zone is pinned to UTC because the conversion depends on it.
+
+## The time parser never throws
+
+`gtfs_time_to_seconds` validates the shape with a regex before any arithmetic,
+so malformed input becomes null instead of an exception under ANSI mode. Nulls it
+creates are counted separately from nulls published at source, and must be zero.
+
+## Shared transforms live in `src/`, as plain files
+
+`clean_strings`, `cast_columns`, `guard_unique` and the GTFS time functions are
+importable modules in `src/transforms/`, not notebook cells. The first attempt
+created them as notebooks named `common.py`, which Python cannot import —
+notebooks are stored with a Databricks header and a doubled extension. They must
+be workspace files.
+
+---
+
+## Realtime silver: one row per observation, loaded by incremental MERGE
+
+Grain: one row per `(vehicle_id, vehicle_ts)` — one row per report a vehicle
+made, however many snapshots carried it. Carriages: one row per
+`(vehicle_id, vehicle_ts, carriage_sequence)`.
+
+**The source is always collapsed to the grain before merging.** A MERGE into an
+empty target inserts every duplicate source row silently; into a populated target
+it fails. Both were reproduced on real data.
+
+**Collapsing keeps the latest snapshot's values plus `first_seen_snapshot_ts` and
+`last_seen_snapshot_ts`.** Min and max are idempotent: re-reading overlapping
+snapshots cannot change them. A count of appearances would not be — every
+overlapping re-read would inflate it — so none is stored.
+
+**Two conditional update rules.** Update values only when the incoming copy comes
+from a later snapshot; pull `first_seen` back only when the incoming copy was seen
+earlier. An identical re-read matches neither and writes nothing, so re-runs are
+free.
+
+**Watermark with a one-hour lookback.** Each run reads snapshots newer than the
+watermark minus an hour. Correctness never depends on files arriving in order,
+and the overlap costs nothing because the merge is idempotent. The watermark
+moves forward only after both merges commit: a crash in between causes a harmless
+re-read next run, whereas advancing it first would skip data permanently.
+
+**Grain keys are asserted non-null before every merge.** `NULL = NULL` is not
+true, so a null key never matches and would be re-inserted on every run.
+
+**The dedup is deterministic.** Ties break on `_source_file`, because MERGE may
+scan its source more than once, and a non-deterministic source can differ
+between scans.
+
+Every run appends to `ops.pipeline_runs`, and the table's own `DESCRIBE HISTORY`
+metrics supply the inserted and updated counts.

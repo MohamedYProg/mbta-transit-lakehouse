@@ -114,10 +114,14 @@ business logic, which is what makes the transformations unit-testable.
 
 Work in progress.
 
-**Built** — catalog and schema layout · scheduled realtime collector ·
-static GTFS ingestion into six bronze tables · idempotent bronze writes
+**Built** — catalog and schema layout · scheduled collectors for vehicle
+positions and alerts, with failure alerting · static GTFS ingestion into six
+bronze tables across three feed versions, idempotent via `replaceWhere` and
+rebuildable from the landing zone · realtime bronze with an explicit schema,
+validated against the data on every load · health check reading the landing
+zone directly
 
-**Next** — realtime JSON into bronze with an explicit schema · silver
+**Next** — silver
 dimensions · service-day time parsing · incremental MERGE · star schema ·
 quality rules engine and quarantine · pytest suite · orchestration
 

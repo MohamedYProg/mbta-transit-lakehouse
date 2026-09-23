@@ -1,0 +1,78 @@
+- table: transit.silver.stops
+  rules:
+    - {name: stop_id_not_null,      type: not_null,   column: stop_id,   severity: error}
+    - {name: stop_id_unique,        type: unique,     columns: [stop_id], severity: error}
+    - {name: stop_name_not_null,    type: not_null,   column: stop_name, severity: error}
+    - {name: stop_lat_in_region,    type: range,      column: stop_lat,  severity: error,
+       params: {min: 41.0, max: 43.5}}
+    - {name: stop_lon_in_region,    type: range,      column: stop_lon,  severity: error,
+       params: {min: -72.5, max: -69.5}}
+    - {name: location_type_known,   type: accepted_values, column: location_type, severity: error,
+       params: {values: [0, 1, 2, 3, 4]}}
+    - {name: coords_present_for_stops, type: not_null, column: stop_lat, severity: error,
+       where: "location_type IN (0, 1, 2)"}
+    - {name: parent_station_exists, type: referential_integrity, column: parent_station, severity: error,
+       params: {to: transit.silver.stops, to_column: stop_id}}
+
+- table: transit.silver.routes
+  rules:
+    - {name: route_id_unique,       type: unique,     columns: [route_id], severity: error}
+    - {name: route_type_known,      type: accepted_values, column: route_type, severity: warn,
+       params: {values: [0, 1, 2, 3, 4, 5, 6, 7, 11, 12]}}
+    - {name: route_type_named,      type: not_null,   column: route_type_name, severity: warn}
+
+- table: transit.silver.trips
+  rules:
+    - {name: trip_id_unique,        type: unique,     columns: [trip_id], severity: error}
+    - {name: route_exists,          type: referential_integrity, column: route_id, severity: error,
+       params: {to: transit.silver.routes, to_column: route_id}}
+
+- table: transit.silver.stop_times
+  rules:
+    - {name: grain_unique,          type: unique,     columns: [trip_id, stop_sequence], severity: error}
+    - {name: departure_parsed,      type: expression, severity: error,
+       params: {expression: "departure_time IS NULL OR departure_seconds IS NOT NULL"}}
+    - {name: arrival_before_departure, type: expression, severity: error,
+       params: {expression: "arrival_seconds <= departure_seconds"}}
+    - {name: seconds_within_30h,    type: range,      column: departure_seconds, severity: error,
+       params: {min: 0, max: 108000}}
+    - {name: row_count_plausible,   type: row_count_range, severity: warn,
+       params: {min: 2500000, max: 4000000}}
+
+- table: transit.silver.vehicle_positions
+  rules:
+    - {name: grain_unique,          type: unique,     columns: [vehicle_id, vehicle_ts], severity: error}
+    - {name: latitude_in_region,    type: range,      column: latitude,  severity: error,
+       params: {min: 41.0, max: 43.5}}
+    - {name: longitude_in_region,   type: range,      column: longitude, severity: error,
+       params: {min: -72.5, max: -69.5}}
+    - {name: bearing_is_a_bearing,  type: range,      column: bearing,   severity: error,
+       params: {min: 0, max: 360}}
+    - {name: occupancy_is_a_pct,    type: range,      column: occupancy_pct, severity: error,
+       params: {min: 0, max: 100}}
+    - {name: status_known,          type: accepted_values, column: current_status, severity: warn,
+       params: {values: [INCOMING_AT, STOPPED_AT, IN_TRANSIT_TO]}}
+    - {name: not_frozen_over_1h,    type: expression, severity: warn,
+       params: {expression: "last_seen_snapshot_ts - first_seen_snapshot_ts < 3600",
+                max_failed_pct: 0.5}}
+    - {name: data_is_fresh,         type: freshness,  column: vehicle_ts, severity: warn,
+       params: {max_age_seconds: 5400}}
+
+- table: transit.silver.vehicle_carriages
+  rules:
+    - {name: grain_unique,          type: unique,     columns: [vehicle_id, vehicle_ts, carriage_sequence], severity: error}
+    - {name: carriage_sequence_1_to_6, type: range,   column: carriage_sequence, severity: error,
+       params: {min: 1, max: 6}}
+
+- table: transit.gold.fact_vehicle_position
+  rules:
+    - {name: route_key_resolves,    type: referential_integrity, column: route_key, severity: error,
+       params: {to: transit.gold.dim_route, to_column: route_key}}
+    - {name: trip_key_resolves,     type: referential_integrity, column: trip_key, severity: error,
+       params: {to: transit.gold.dim_trip, to_column: trip_key}}
+    - {name: stop_key_resolves,     type: referential_integrity, column: stop_key, severity: error,
+       params: {to: transit.gold.dim_stop, to_column: stop_key}}
+    - {name: date_key_resolves,     type: referential_integrity, column: date_key, severity: error,
+       params: {to: transit.gold.dim_date, to_column: date_key}}
+    - {name: unknown_trip_rate,     type: expression, severity: warn,
+       params: {expression: "trip_key != -1", max_failed_pct: 1.0}}
