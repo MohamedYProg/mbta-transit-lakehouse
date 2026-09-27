@@ -251,14 +251,41 @@ watermarked load in story 2.3.
 
 ---
 
-## Unscheduled service routes to the unknown member
+## Added trips get their own special member
 
-4.9% of realtime rows are replacement shuttles (`Shuttle-Generic*`,
-`schedule_relationship = ADDED`), added to service rather than scheduled. Their
-trips are not expected in the static timetable (to be confirmed by the join in
-story 2.6). They are kept, resolved to the `-1` unknown member in gold, and counted as a quality
-metric. Dropping them would erase the vehicles that exist precisely because
-scheduled service failed.
+Story 2.6 measured it: 7.83% of observations carry a `trip_id` that no dimension
+row matches, and 97% of those are trips MBTA added live (`schedule_relationship =
+ADDED`) and never published. Only 0.24% are genuine mismatches — trips an older
+schedule had and the current one lacks.
+
+Routing both to `-1` makes a normal operational event (added service)
+indistinguishable from a data problem, and inflates the "unknown" metric about
+thirty-fold. So `dim_trip` carries two special members: `-1` Unknown and `-2`
+Added trip (unscheduled). Rows are never dropped either way — dropping them would
+erase the vehicles that exist precisely because scheduled service failed.
+
+The route side needs neither: `Shuttle-Generic` routes are published in the static
+schedule and resolve normally.
+
+## The fact takes silver's grain, not the snapshot grain
+
+`fact_vehicle_position` has one row per vehicle report `(vehicle_id,
+vehicle_ts)`, not one per vehicle per snapshot as first planned. The snapshot
+grain would reintroduce the duplication silver removes — up to 40 rows for one
+frozen observation. Snapshot presence survives as `first_seen` / `last_seen` and
+the derived `report_age_s` and `frozen_s` measures.
+
+## Facts keep their natural ids
+
+`route_id`, `trip_id` and `stop_id` stay on the fact beside the surrogate keys.
+Once a row resolves to a special member, the natural id is the only way to find
+out what failed to match — which is how the added-trip finding was made.
+
+## Joins are guarded against fan-out
+
+Each dimension lookup asserts unique natural keys before joining, and the fact
+asserts its row count equals silver's. A dimension with a duplicated key would
+otherwise multiply fact rows silently through a left join.
 
 ---
 
@@ -422,3 +449,34 @@ between scans.
 
 Every run appends to `ops.pipeline_runs`, and the table's own `DESCRIBE HISTORY`
 metrics supply the inserted and updated counts.
+
+---
+
+## Quality rules are configuration, not code
+
+`config/quality_rules.yaml` holds 34 rules across 7 tables; `src/quality/rules.py`
+holds seven rule types. Adding a check is four lines of YAML. Every threshold
+comes from a measured value rather than a guess — the service-area box, carriage
+sequence 1-6, the 1% unknown-trip tolerance, the 35-minute collector freshness.
+
+Row-level rules return a `Column` that is true for failing rows, not a count.
+Story 3.2 reuses the same conditions to split valid rows from rejected ones, so
+the engine and the quarantine cannot disagree about what "bad" means.
+
+All row-level rules for a table evaluate in a single aggregate pass — one
+`sum(condition)` per rule — instead of two queries each. Nine rules over
+`silver.vehicle_positions` cost one scan.
+
+A rule that throws is recorded as a failed rule, not allowed to kill the run, so
+one broken rule cannot hide the other thirty-three.
+
+## Error fails the pipeline, warn is recorded and continues
+
+`error` means this cannot be true and the run should stop. `warn` means this is
+unusual and worth watching. Collapsing the two is how quality systems end up
+ignored, so rules that describe real but notable conditions — over-capacity
+buses, frozen vehicles, the unknown-trip rate — are warnings with an explicit
+tolerance rather than errors.
+
+Tolerances are percentages, not absolutes, so they stay meaningful as the data
+grows.

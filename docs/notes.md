@@ -543,3 +543,43 @@ is a trip present in an older schedule version only, and all 776 fall on one
 weekend: 736 on Saturday 19th and 40 on Sunday 20th, with zero on every weekday.
 The schedule-change mismatch is not spread across the data — it is that weekend's
 trips, which the 2026-09-21 publication no longer contains.
+
+---
+
+## The quality engine's first run found three things
+
+34 rules across 7 tables in 27 seconds. Row-level rules evaluate in one aggregate
+pass per table, so a table with nine rules costs one scan rather than eighteen.
+
+A deliberately corrupted copy of `silver.stops` (impossible latitude, missing
+station names, three duplicated ids) failed exactly the three rules it should and
+nothing else.
+
+**1. The occupancy rule was wrong, not the data.** 1,843 observations (0.57%)
+reported `occupancy_percentage` above 100, all of them buses with
+`occupancy_status = FULL`, in multiples of 20 up to 300:
+
+| bucket | rows | min | max |
+|---|---|---|---|
+| 0-100 | 226,990 | 0 | 100 |
+| 101-150 | 1,592 | 120 | 140 |
+| 151-200 | 243 | 160 | 200 |
+| over 200 | 8 | 220 | 300 |
+
+The GTFS-Realtime spec allows values above 100 — a vehicle can carry more than its
+rated capacity. The threshold came from intuition and the data disagreed. Split
+into an error rule (0-400, genuine nonsense) and a warning that tracks
+over-capacity crowding as a metric with a 2% tolerance.
+
+**2. Twenty-one vehicles reported positions hundreds of miles away.** All `ynk*`
+ids on `Shuttle-Generic`, all inside a four-minute window on 18 Sep around 16:45
+Boston time: Manhattan and Newark (40.7, -74.0), Hartford (41.75, -72.70),
+Wilmington DE (39.7, -75.55). Not scattered noise — one burst, one contracted
+operator's fleet feed. First genuine quarantine candidates.
+
+(17 rows fail the latitude rule and 21 the longitude rule: Hartford's latitude is
+inside the band while its longitude is not.)
+
+**3. The freshness rule works.** It flagged silver as stale because bronze RT had
+not been refreshed since the previous day. Correct, and a preview of what the
+scheduled DAG in 3.7 fixes.

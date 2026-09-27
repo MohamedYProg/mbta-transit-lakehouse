@@ -42,14 +42,17 @@
 - table: transit.silver.vehicle_positions
   rules:
     - {name: grain_unique,          type: unique,     columns: [vehicle_id, vehicle_ts], severity: error}
-    - {name: latitude_in_region,    type: range,      column: latitude,  severity: error,
+    - {name: latitude_in_region,    type: range,quarantine: true,      column: latitude,  severity: error,
        params: {min: 41.0, max: 43.5}}
-    - {name: longitude_in_region,   type: range,      column: longitude, severity: error,
+    - {name: longitude_in_region,   type: range,quarantine: true,      column: longitude, severity: error,
        params: {min: -72.5, max: -69.5}}
-    - {name: bearing_is_a_bearing,  type: range,      column: bearing,   severity: error,
+    - {name: bearing_is_a_bearing,  type: range,quarantine: true,      column: bearing,   severity: error,
        params: {min: 0, max: 360}}
-    - {name: occupancy_is_a_pct,    type: range,      column: occupancy_pct, severity: error,
-       params: {min: 0, max: 100}}
+    - {name: occupancy_is_plausible,quarantine: true, type: range, column: occupancy_pct, severity: error,
+       params: {min: 0, max: 400}}
+    - {name: occupancy_over_100,     type: expression, severity: warn,
+       params: {expression: "occupancy_pct IS NULL OR occupancy_pct <= 100",
+                max_failed_pct: 2.0}}
     - {name: status_known,          type: accepted_values, column: current_status, severity: warn,
        params: {values: [INCOMING_AT, STOPPED_AT, IN_TRANSIT_TO]}}
     - {name: not_frozen_over_1h,    type: expression, severity: warn,
