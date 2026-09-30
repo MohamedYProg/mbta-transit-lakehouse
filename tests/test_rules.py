@@ -5,7 +5,6 @@ failures) and the quarantine (which splits rows). If these drift apart, a row
 can be reported as bad and still reach silver.
 """
 import pytest
-from pyspark.sql import functions as F
 
 from src.quality.rules import (ROW_LEVEL, evaluate, evaluate_row_level_batch,
                                failure_condition, verdict)

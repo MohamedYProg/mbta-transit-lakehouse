@@ -4,7 +4,6 @@ collapse_to_grain is what makes the incremental MERGE safe: a MERGE fails when
 two source rows match one target row, and duplicate observations are normal
 because the poll interval is finer than some vehicles' reporting interval.
 """
-import pytest
 from pyspark.sql import functions as F
 from pyspark.sql.types import (ArrayType, BooleanType, DoubleType, IntegerType,
                                LongType, StringType, StructField, StructType)
