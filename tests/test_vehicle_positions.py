@@ -4,8 +4,6 @@ collapse_to_grain is what makes the incremental MERGE safe: a MERGE fails when
 two source rows match one target row, and duplicate observations are normal
 because the poll interval is finer than some vehicles' reporting interval.
 """
-import pytest
-from pyspark.sql import functions as F
 from pyspark.sql.types import (ArrayType, BooleanType, DoubleType, IntegerType,
                                LongType, StringType, StructField, StructType)
 
@@ -161,16 +159,20 @@ class TestCollapseToGrain:
         assert collapse_to_grain(flatten_vehicle_positions(df), VP_KEY).count() == 2
 
     def test_is_idempotent(self, spark):
-        """Collapsing an already-collapsed frame changes nothing, which is what
-        makes re-reading overlapping snapshots safe."""
+        """Collapsing rows that are already at the grain changes nothing, which
+        is what makes re-reading overlapping snapshots safe."""
         df = bronze(spark, [("f1", 1000, entity("v1", 990)),
                             ("f2", 1900, entity("v1", 990))])
-        once = collapse_to_grain(flatten_vehicle_positions(df), VP_KEY)
-        twice = collapse_to_grain(once.withColumn("_snapshot_ts",
-                                                  F.col("last_seen_snapshot_ts")), VP_KEY)
+        flat = flatten_vehicle_positions(df)
+
+        once = collapse_to_grain(flat, VP_KEY)
+        twice = collapse_to_grain(flat.union(flat), VP_KEY)   # the same snapshots re-read
+
         assert once.count() == twice.count() == 1
-        assert (twice.first().first_seen_snapshot_ts,
-                twice.first().last_seen_snapshot_ts) == (1000, 1900)
+        a, b = once.first(), twice.first()
+        assert (a.first_seen_snapshot_ts, a.last_seen_snapshot_ts) == (1000, 1900)
+        assert (b.first_seen_snapshot_ts, b.last_seen_snapshot_ts) == (1000, 1900)
+        assert a.current_status == b.current_status
 
     def test_carriage_grain_includes_the_sequence(self, spark):
         cars = [{"carriage_sequence": i, "label": f"c{i}",

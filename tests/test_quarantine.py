@@ -6,7 +6,6 @@ no row is ever silently dropped. valid + rejected == input, always.
 import json
 
 import pytest
-from pyspark.sql import functions as F
 
 from src.quality.quarantine import reconcile, reject_reasons, split, to_rejects
 
